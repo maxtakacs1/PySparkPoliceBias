@@ -2,8 +2,7 @@
 #
 # FLOW:
 #  - On first run:
-#       * Reads RAW ZIP from GCS (NC statewide CSV ZIP)
-#       * Extracts CSV on driver, uploads CSV back to GCS
+#       * Reads RAW CSV from GCS (NC statewide CSV already extracted from ZIP)
 #       * Cleans + enriches data:
 #           - time features
 #           - labels & flags
@@ -21,7 +20,7 @@
 # Run (from master VM SSH):
 #   spark-submit --master yarn --deploy-mode cluster main.py
 
-import os, sys, math, json, zipfile, subprocess
+import os, sys, math, json
 from datetime import datetime, timezone
 from urllib.request import urlopen
 from urllib.parse import urlencode
@@ -33,10 +32,14 @@ from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, St
 from pyspark.ml.classification import LogisticRegression, GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 
+# CONFIG / PATHS
+
 BUCKET = "gs://main-bucket-67"
 
-# RAW ZIP from Open Policing Project
-RAW_URI = f"{BUCKET}/raw/yg821jf8611_nc_statewide_2020_04_01.csv.zip"
+# RAW CSV from Open Policing Project (already extracted from ZIP and uploaded)
+# Make sure this exists:
+#   gsutil cp nc_statewide_2020_04_01.csv gs://main-bucket-67/raw/nc_statewide_2020_04_01.csv
+RAW_URI = f"{BUCKET}/raw/nc_statewide_2020_04_01.csv"
 
 # Enriched Parquet location (directory)
 ENRICHED_PATH = f"{BUCKET}/outputs/enriched/nc"
@@ -52,7 +55,8 @@ SEED = 67
 SAMPLE_FRAC = 1.0 # 0.05, etc. for testing
 RUN_GBT = True # also train GBT models
 HASH_DEPT = True # hash department_name
-NUM_HASH_FEAT = 1 << 18 # 262,144 hashed dims
+NUM_HASH_FEAT = 1 << 18  # 262,144 hashed dims
+
 
 # SPARK / HDFS HELPERS
 
@@ -69,32 +73,6 @@ def write_json_to_gcs(spark, obj, path: str):
           .coalesce(1)
           .write.mode("overwrite").text(path))
 
-def run_cmd(cmd: str):
-    print(f"[CMD] {cmd}")
-    subprocess.check_call(cmd, shell=True)
-
-# ZIP -> CSV IN GCS
-def ensure_csv_on_gcs_from_zip(raw_zip_uri: str, target_csv_uri: str):
-    """
-    1) Copy ZIP from GCS to /tmp on driver
-    2) Extract first CSV to /tmp
-    3) Upload CSV back to GCS at target_csv_uri
-    """
-    os.makedirs("/tmp/nc_raw", exist_ok=True)
-    local_zip = "/tmp/nc_raw/data.zip"
-    local_csv = "/tmp/nc_raw/nc_extracted.csv"
-
-    run_cmd(f"gsutil cp {raw_zip_uri} {local_zip}")
-
-    with zipfile.ZipFile(local_zip, "r") as zf:
-        csv_members = [m for m in zf.namelist() if m.lower().endswith(".csv")]
-        if not csv_members:
-            raise RuntimeError("ZIP contains no CSV files.")
-        first = csv_members[0]
-        with zf.open(first) as f_in, open(local_csv, "wb") as f_out:
-            f_out.write(f_in.read())
-
-    run_cmd(f"gsutil cp {local_csv} {target_csv_uri}")
 
 # CLEANING / FEATURE UTILS
 
@@ -186,6 +164,7 @@ def add_basic_labels_flags(df):
 
 
 # ACS FETCH AND JOIN
+
 def _to_float(x):
     try:
         return float(x)
@@ -197,7 +176,7 @@ def census_get(year: int, dataset_suffix: str, vars_list):
     params = {
         "get": ",".join(["NAME"] + vars_list),
         "for": "county:*",
-        "in": "state:37", # 37 = North Carolina
+        "in": "state:37",  # 37 = North Carolina
     }
     if CENSUS_API_KEY:
         params["key"] = CENSUS_API_KEY
@@ -222,9 +201,9 @@ def census_get(year: int, dataset_suffix: str, vars_list):
 def fetch_nc_acs(years):
     # variables:
     #  median income: B19013_001E  (acs5)
-    #  poverty %: S1701_C03_001E (subject)
-    #  unemployment %: S2301_C04_001E (subject)
-    #  bachelor's or higher: DP02_0068PE (profile)
+    #  poverty %:     S1701_C03_001E (subject)
+    #  unemployment%: S2301_C04_001E (subject)
+    #  bachelor's+:   DP02_0068PE (profile)
     acs_rows = []
     for y in sorted(set(years)):
         acs_rows += census_get(y, "", ["B19013_001E"])
@@ -289,7 +268,9 @@ def add_acs_join(df, spark):
     ).drop(acs_df["county_name_norm"]).drop(acs_df["acs_year"])
     return df
 
+
 # MODEL PIPELINES
+
 def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool, num_hash_features: int):
     cat_small = [c for c in ["subject_race", "subject_sex", "reason_for_stop", "type", "county_name"]
                  if c in train_df.columns]
@@ -346,7 +327,9 @@ def fairness_by(df, label_col, pred_col, group_col):
              .withColumn("Rate", F.when((F.col("P") + F.col("N")) > 0,
                                         F.col("Pos") / (F.col("P") + F.col("N")))))
 
+
 # MAIN
+
 if __name__ == "__main__":
     spark = (SparkSession.builder
              .appName("nc-opp-enrich-train")
@@ -358,25 +341,19 @@ if __name__ == "__main__":
         print(f"[INFO] Enriched dataset exists at {ENRICHED_PATH} — loading.")
         enriched_df = spark.read.parquet(ENRICHED_PATH)
     else:
-        print(f"[INFO] Enriched dataset NOT found; building from raw ZIP: {RAW_URI}")
-        parts = RAW_URI.replace("gs://", "").split("/", 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        base_prefix = "/".join(key.split("/")[:-1])
-        csv_uri = (f"gs://{bucket}/{base_prefix}/_extracted_nc.csv"
-                   if base_prefix else f"gs://{bucket}/_extracted_nc.csv")
+        print(f"[INFO] Enriched dataset NOT found; building from raw CSV: {RAW_URI}")
 
-        ensure_csv_on_gcs_from_zip(RAW_URI, csv_uri)
+        # Directly read CSV from GCS (no ZIP or subprocess)
+        raw = spark.read.option("header", True).csv(RAW_URI)
 
-        raw = spark.read.option("header", True).csv(csv_uri)
-        df  = clean_column_names(raw)
-        df  = standardize_strings(df, ["location", "county_name", "subject_race", "subject_sex",
-                                       "officer_id_hash", "department_name", "type",
-                                       "outcome", "reason_for_stop"])
-        df  = normalize_booleans(df)
-        df  = clip_age(df)
-        df  = make_time_features(df)
-        df  = add_basic_labels_flags(df)
+        df = clean_column_names(raw)
+        df = standardize_strings(df, ["location", "county_name", "subject_race", "subject_sex",
+                                      "officer_id_hash", "department_name", "type",
+                                      "outcome", "reason_for_stop"])
+        df = normalize_booleans(df)
+        df = clip_age(df)
+        df = make_time_features(df)
+        df = add_basic_labels_flags(df)
 
         # Global dept_freq (we'll refine with train-only later)
         if "department_name" in df.columns:
