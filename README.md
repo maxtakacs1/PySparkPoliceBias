@@ -1,270 +1,307 @@
 # NC Open Policing – Spark ML Project on GCP Dataproc
 
-This project uses **PySpark on Google Cloud Dataproc** to analyze the **North Carolina State Patrol** data from the Stanford **Open Policing Project** and:
+This project uses **PySpark on Google Cloud Dataproc** to analyze the **North Carolina Statewide Open Policing** data and:
 
-* Enriches the data with **time features** and **county-level ACS demographics**.
-* Trains two sets of models for two labels:
+* Enrich the data with:
+
+  * Time-of-day / day-of-week features
+  * County-level socio-economic features from **ACS**
+  * Department frequency features
+* Train two prediction tasks:
 
   * `citation_issued`
   * `arrest_made`
-* For each label, compares:
+* For each task, compare:
 
-  * **T0** – model **without time** features
-  * **T1** – model **with time** features
-* Runs and compares performance on three **cluster configurations**:
+  * **T0** – model **without time features**
+  * **T1** – model **with time features**
+* Compare performance across three **Dataproc cluster configurations**:
 
-  1. **Single Node**: 4 cores, 24 GB RAM
-  2. **1 Master, 2 Workers**: 4 cores, 24 GB RAM per node
-  3. **1 Master, 4 Workers**: 4 cores, 24 GB RAM per node
+  1. Single node: 4 cores, 16 GB
+  2. 1 master + 2 workers: 4 cores, 16 GB per node
+  3. 1 master + 4 workers: 4 cores, 16 GB per node
 
-Run mode is exactly as requested:
+The workflow is:
 
-> Create Dataproc cluster → SSH into master VM → run `pyspark` (sanity check) → upload `main.py` → run
-> `spark-submit --master yarn --deploy-mode cluster main.py`.
+> Create Dataproc cluster → SSH into master → sanity-check `pyspark` → upload `main.py` → run
+> `spark-submit --master yarn --deploy-mode cluster main.py`
 
----
-
-## 1. Prerequisites
-
-* A **GCP project** with billing enabled.
-* Permissions to:
-
-  * Create **Cloud Storage** buckets.
-  * Create **Dataproc clusters**.
-  * SSH into Dataproc **VM instances**.
-* `yg821jf8611_nc_statewide_2020_04_01.csv.zip` (NC statewide Open Policing dataset).
-* (Optional but recommended) a **Census API key** for ACS:
-
-  * Can be requested from the US Census:
-    [https://www.census.gov/data/developers/guidance/api-user-guide.html](https://www.census.gov/data/developers/guidance/api-user-guide.html)
-
-Dataproc images already include:
-
-* `pyspark`
-* `spark-submit`
-* `gsutil`
-
-No extra installation is required on the cluster.
+All project code is in `main.py` and is written in **PySpark**.
 
 ---
 
-## 2. Cloud Storage layout
+## 1. Project Files & Config
 
-1. In the GCP Console, go to:
-   **Navigation ☰ → Cloud Storage → Buckets → Create**
-2. Create a bucket (example):
-   `your-nc-opp-bucket`
+### `main.py`
 
-   * Region: choose one (e.g., `us-central1`). Remember this for Dataproc.
-3. Inside the bucket, create folders:
+* Main Dataproc / YARN driver script.
+* Handles:
 
-```text
-gs://your-nc-opp-bucket/
-  raw/
-  code/      # optional – to store main.py
-  outputs/   # will be created/used by the job
-```
+  * Reading **raw CSV** from GCS.
+  * Enrichment (time features, ACS join, dept frequency).
+  * Writing and reusing **enriched Parquet**.
+  * Training and evaluating models.
 
-4. Upload the raw ZIP:
-
-```text
-raw/yg821jf8611_nc_statewide_2020_04_01.csv.zip
-```
-
----
-
-## 3. `main.py` – Configuration and Overview
-
-The main driver script is `main.py`. It is intended to be run via:
-
-```bash
-spark-submit --master yarn --deploy-mode cluster main.py
-```
-
-### 3.1. Configuration constants
-
-At the top of `main.py`, edit only the constants in the **CONFIG** section:
+At the top of `main.py` you’ll see:
 
 ```python
-# GCS bucket (must include gs://)
-BUCKET = "gs://your-nc-opp-bucket"  # <-- CHANGE THIS
+BUCKET = "gs://main-bucket-67"
 
-# RAW ZIP from Open Policing Project (already uploaded to your bucket)
-RAW_URI = f"{BUCKET}/raw/yg821jf8611_nc_statewide_2020_04_01.csv.zip"
+# RAW CSV from Open Policing Project (already extracted from ZIP and uploaded)
+RAW_URI = f"{BUCKET}/raw/nc_statewide_2020_04_01.csv"
 
-# Enriched Parquet location (directory)
 ENRICHED_PATH = f"{BUCKET}/outputs/enriched/nc"
+OUTPUT_BASE   = f"{BUCKET}/outputs"
 
-# Outputs base (models + metrics)
-OUTPUT_BASE = f"{BUCKET}/outputs"
+CENSUS_API_KEY = "..."  # your ACS API key
 
-# Optional Census API key; None = anonymous (OK for small pulls)
-CENSUS_API_KEY = None  # e.g., "YOUR_CENSUS_KEY"
-
-# Training knobs (no CLI args)
-SEED          = 42
-SAMPLE_FRAC   = 1.0          # set <1.0 for quick subsample runs, e.g. 0.05
-RUN_GBT       = True         # also train GBT models
-HASH_DEPT     = True         # hash department_name
-NUM_HASH_FEAT = 1 << 18      # 262,144 hashed dims
+SEED        = 67
+SAMPLE_FRAC = 0.05      # fraction of enriched data used for modeling
+RUN_GBT     = True      # also train GBT models
+HASH_DEPT   = True      # use FeatureHasher for department_name
+NUM_HASH_FEAT = 1 << 18
 ```
 
-Everything else in `main.py` is ready to go.
+You only need to change:
 
-### 3.2. What the script does
+* `BUCKET` if your bucket name is different.
+* You can optionally tweak `SAMPLE_FRAC`, `RUN_GBT`, etc.
 
-On **first run**:
+---
 
-1. **Enrichment step**
+## 2. Data Preparation in GCS
 
-   * Reads `RAW_URI` (ZIP) from GCS.
-   * On the Dataproc master:
+### 2.1. Create / choose GCS bucket
 
-     * Copies ZIP to `/tmp`
-     * Extracts the first CSV
-     * Uploads the CSV back to GCS (next to the ZIP).
-   * Loads CSV with Spark and:
+In the GCP Console:
 
-     * Cleans columns and handles `"NaN"` / empty strings.
-     * Normalizes boolean-like fields (`true/false`, `yes/no`, etc.) into `0/1`.
-     * Clips `subject_age` to [16, 100], nulls anything outside.
-     * Builds **time features**:
+1. **Navigation ☰ → Cloud Storage → Buckets → Create**
+2. Create a bucket (e.g. `main-bucket-67`) in the same region you’ll use for Dataproc (e.g. `us-central1`).
 
-       * `time_available`, `hour_of_day`, `day_of_week`, `is_weekend`
-       * `hour_sin`, `hour_cos`
-     * Creates labels and flags:
-
-       * `citation_yn`, `arrest_yn`
-       * `outcome_multiclass` (arrest/citation/warning/other)
-       * `location_known`, `county_known`
-       * Normalized `county_name_norm` for ACS joining.
-     * Computes initial global `dept_freq` from `department_name`.
-     * Calls the **Census ACS API** for NC counties and joins:
-
-       * `median_income`
-       * `poverty_rate`
-       * `unemployment_rate`
-       * `edu_bachelor_pct`
-   * Writes partitioned **enriched Parquet** to `ENRICHED_PATH`.
-
-On **subsequent runs**:
-
-* If `ENRICHED_PATH` exists in GCS, the script **skips enrichment** and directly loads it.
-
-2. **Modeling step**
-
-For each label in:
-
-* `citation_issued`
-* `arrest_made`
-
-it:
-
-* Filters to rows where `time_available == 1` (to compare with vs without time on same cohort).
-* Performs an **80/20 train/test random split** (fixed seed).
-* Computes **class weights** (`weightCol = class_w`) for class imbalance.
-* Builds and trains:
-
-  * **T0** (no time features):
-
-    * Demographics, stop context, county & ACS, department info.
-  * **T1** (with time features):
-
-    * All T0 features + `time_available`, `hour_of_day`, `hour_sin`, `hour_cos`, `is_weekend`.
-  * Algorithms:
-
-    * Logistic Regression (always)
-    * Gradient-Boosted Trees (if `RUN_GBT = True`)
-* Evaluates:
-
-  * AUROC, AUPRC for each model.
-  * Fairness snapshots (TPR, FPR, selection rate) by `subject_race` and `subject_sex`.
-
-3. **Outputs**
-
-For each label, writing under:
+In this README we assume:
 
 ```text
-gs://your-nc-opp-bucket/outputs/<label>/<timestamp>/
-  models/
-    LR_T0/
-    LR_T1/
-    GBT_T0/ (if RUN_GBT)
-    GBT_T1/ (if RUN_GBT)
-  metrics/json/
-    part-*.txt   # contains a single JSON string with metrics + fairness tables
+gs://main-bucket-67/
 ```
 
-The enriched dataset lives at:
+### 2.2. Upload the NC statewide CSV
+
+You start from the **ZIP** from the Stanford Open Policing Project.
+
+On your local machine or on the Dataproc master VM:
+
+```bash
+# Example on the Dataproc master VM or Cloud Shell
+
+# 1) Copy ZIP to current directory (if it’s already in GCS)
+gsutil cp gs://main-bucket-67/raw/yg821jf8611_nc_statewide_2020_04_01.csv.zip .
+
+# 2) Unzip
+unzip yg821jf8611_nc_statewide_2020_04_01.csv.zip
+
+# 3) Upload CSV back to GCS
+gsutil cp yg821jf8611_nc_statewide_2020_04_01.csv \
+  gs://main-bucket-67/raw/nc_statewide_2020_04_01.csv
+```
+
+Your bucket layout will look like:
 
 ```text
-gs://your-nc-opp-bucket/outputs/enriched/nc/
+gs://main-bucket-67/
+  raw/
+    yg821jf8611_nc_statewide_2020_04_01.csv.zip   # original
+    nc_statewide_2020_04_01.csv                   # raw CSV used by main.py
+  outputs/
+    enriched/   # enriched data under 'nc'
+    ...         # model outputs per label
+```
+
+Make sure `RAW_URI` in `main.py` points to this CSV.
+
+---
+
+## 3. What `main.py` Does
+
+### 3.1. Enrichment (build or reuse)
+
+At runtime, `main.py` does:
+
+1. **Check if enriched data exists**:
+
+   ```python
+   if gcs_exists(spark, ENRICHED_PATH):
+       try:
+           enriched_df = spark.read.parquet(ENRICHED_PATH)
+       except Exception:
+           # If read fails (e.g., corrupted/empty dataset), rebuild from raw
+           enriched_df = build_enriched_from_raw(spark)
+   else:
+       enriched_df = build_enriched_from_raw(spark)
+   ```
+
+2. **`build_enriched_from_raw`** does:
+
+   * Reads **raw CSV** from `RAW_URI` (GCS).
+   * Cleans & standardizes:
+
+     * Column names → lowercase with `_`
+     * String columns → strips `"nan"` / empty → `NULL`
+     * Boolean-like columns → 0/1 (`citation_issued`, `arrest_made`, etc.)
+     * `subject_age` clipped to [16, 100]
+   * Adds **time features**:
+
+     * `time_available`, `hour_of_day`, `hour_sin`, `hour_cos`, `day_of_week`, `is_weekend`, `year`
+   * Adds **labels and flags**:
+
+     * `citation_yn`, `arrest_yn`
+     * `outcome_multiclass` (arrest / citation / warning / other)
+     * `location_known`, `county_known`
+     * `county_name_norm` (for ACS join)
+   * Computes global **department frequency**:
+
+     * `dept_freq` = count of rows per `department_name`
+   * Calls **ACS API** (via `CENSUS_API_KEY`) for NC counties:
+
+     * `median_income`
+     * `poverty_rate`
+     * `unemployment_rate`
+     * `edu_bachelor_pct`
+   * Joins ACS data onto stops based on normalized county name and year (or nearest ACS year).
+   * Writes **partitioned Parquet** to:
+
+     ```text
+     gs://main-bucket-67/outputs/enriched/nc/
+     ```
+
+3. On **subsequent runs**, if the Parquet is valid, it just loads from `ENRICHED_PATH` without calling ACS or recomputing features.
+
+4. After enrichment, if `SAMPLE_FRAC < 1.0`, the code downsamples for training:
+
+   ```python
+   enriched_df = enriched_df.sample(False, SAMPLE_FRAC, seed=SEED)
+   ```
+
+### 3.2. Modeling
+
+For each label in `["citation_issued", "arrest_made"]`:
+
+1. **Filter** to rows with `time_available == 1` and non-null label.
+
+2. Do an **80/20 random split** (`train`, `test`) with seed.
+
+3. Compute **class weights**:
+
+   * Higher weight for the minority class (label = 1), stored in `class_w`.
+   * Used as `weightCol="class_w"` in Logistic Regression.
+
+4. Build two feature pipelines:
+
+   * **T0 (no time)**: demographics, dept info, county + ACS, but **no** time features.
+   * **T1 (with time)**: T0 features + `time_available`, `hour_of_day`, `hour_sin`, `hour_cos`, `is_weekend`.
+
+   Both pipelines:
+
+   * Treat small categoricals (`subject_race`, `subject_sex`, `reason_for_stop`, `type`, `county_name`) via `StringIndexer + OneHotEncoder`.
+   * Encode `department_name`:
+
+     * If `HASH_DEPT = True`: hashed via `FeatureHasher` into a fixed-length sparse vector.
+     * If `HASH_DEPT = False`: use numeric `dept_freq`.
+   * Assemble numeric + encoded features → `features_raw`.
+   * Standardize into `features` using `StandardScaler`.
+
+5. Train models:
+
+   * Logistic Regression (`LR_T0`, `LR_T1`) — always.
+   * Gradient-Boosted Trees (`GBT_T0`, `GBT_T1`) — if `RUN_GBT = True`.
+
+6. Evaluate on test set:
+
+   * AUROC (`areaUnderROC`) and AUPRC (`areaUnderPR`).
+   * Fairness-like summaries by `subject_race` and `subject_sex`:
+
+     * TPR, FPR, selection rate.
+
+7. Write models and metrics to GCS:
+
+   For each label (e.g. `citation_issued`) and run timestamp:
+
+   ```text
+   gs://main-bucket-67/outputs/citation_issued/<timestamp>/
+     models/
+       LR_T0/
+       LR_T1/
+       GBT_T0/        # if RUN_GBT = True
+       GBT_T1/        # if RUN_GBT = True
+     metrics/json/
+       part-*.txt     # single JSON string with all metrics + fairness info
+   ```
+
+The enriched data lives at:
+
+```text
+gs://main-bucket-67/outputs/enriched/nc/
 ```
 
 ---
 
-## 4. Creating and running on each cluster configuration
+## 4. Dataproc Cluster Configurations
 
-You will **repeat this section three times**, once per cluster configuration:
+You’ll run the same script on three cluster shapes:
 
-1. Single Node (4 cores, 24 GB)
-2. 1 Master + 2 Workers (each 4 cores, 24 GB)
-3. 1 Master + 4 Workers (each 4 cores, 24 GB)
+1. **Single Node**
 
-### 4.1. Create cluster – Single Node (4 cores, 24 GB)
+   * 1 node
+   * 4 vCPUs, 16 GB RAM
 
-1. Console → **Dataproc → Clusters → Create cluster**.
-2. Region: same as your bucket (e.g., `us-central1`).
-3. **Cluster type**: **Single node**.
-4. Under **Configure nodes → Primary node → Machine type → Customize**:
+2. **1 Master + 2 Workers**
 
-   * Set **vCPUs = 4**
-   * Set **Memory = 24 GB**
-5. Under **Components**, enable **Component Gateway** (optional).
-6. Under **Properties** (expand “Customize cluster” → “Properties”), you can add:
+   * Primary: 4 vCPUs, 16 GB
+   * 2 workers: each 4 vCPUs, 16 GB
 
-   * `spark:spark.sql.shuffle.partitions=200`
-7. Click **Create** and wait for cluster to be ready.
+3. **1 Master + 4 Workers**
 
-### 4.2. Create cluster – 1 Master + 2 Workers (4 cores, 24 GB each)
+   * Primary: 4 vCPUs, 16 GB
+   * 4 workers: each 4 vCPUs, 16 GB
 
-1. Console → **Dataproc → Clusters → Create cluster**.
-2. Region: same as bucket.
-3. **Cluster type**: **Standard**.
-4. **Primary node**:
+### 4.1. Create cluster – general steps
 
-   * Machine type → **Customize** → 4 vCPUs, 24 GB.
-5. **Worker nodes**:
+For each configuration:
 
-   * Number of workers: **2**
-   * Machine type → **Customize** → 4 vCPUs, 24 GB.
-6. Properties:
+1. GCP Console → **Dataproc → Clusters → Create cluster**.
+2. Choose region (e.g., `us-central1`) matching your bucket.
+3. Choose **Cluster type**:
 
-   * `spark:spark.sql.shuffle.partitions=400`
-7. Click **Create**.
+   * **Single node** OR **Standard** (for multi-node).
+4. Customize machine types:
 
-### 4.3. Create cluster – 1 Master + 4 Workers (4 cores, 24 GB each)
+   * Click **Customize** for primary/worker:
 
-As above, but:
+     * vCPUs: **4**
+     * Memory: **16 GB**
+5. (Optional) Set Spark shuffle partitions in “Properties”:
 
-* Number of workers: **4**
-* Suggested property:
+   * `spark:spark.sql.shuffle.partitions=400` (or more for larger clusters).
+6. Click **Create** and wait for the cluster to be ready.
 
-  * `spark:spark.sql.shuffle.partitions=800`
+Repeat to build:
+
+* Cluster A: Single node.
+* Cluster B: 1M + 2W.
+* Cluster C: 1M + 4W.
 
 ---
 
-## 5. SSH Workflow and Running the Job
+## 5. Running `main.py` on a Cluster
 
-Repeat this for each cluster configuration.
+For **each cluster configuration**, follow the same workflow.
 
-### 5.1. SSH into master VM
+### 5.1. SSH into the master
 
-1. Console → **Dataproc → Clusters** → click your cluster.
-2. Click the **VM instances** tab.
-3. For the master instance (e.g., `cluster-name-m`), click **SSH**.
+1. GCP Console → **Dataproc → Clusters** → click your cluster.
+2. Go to the **VM instances** tab.
+3. Click **SSH** for the master instance (e.g. `cluster-single-node-m`).
 
-### 5.2. Run `pyspark` (sanity check)
+### 5.2. Sanity check PySpark
 
 In the SSH terminal:
 
@@ -272,165 +309,162 @@ In the SSH terminal:
 pyspark
 ```
 
-You should see a PySpark shell start and a `SparkSession` named `spark`.
-
-Type `spark` and confirm it prints a SparkSession object. Then exit:
+You should see a Spark shell and a `spark` session. Then exit:
 
 ```python
 exit()
 ```
 
-### 5.3. Copy `main.py` onto the master
+### 5.3. Upload `main.py` to the master
 
-Option A – If you uploaded `main.py` to GCS:
-
-```bash
-gsutil cp gs://your-nc-opp-bucket/code/main.py .
-```
-
-Option B – Paste manually on the VM:
+Option A: from GCS (if you’ve uploaded it there):
 
 ```bash
-nano main.py
-# paste the entire script from your editor
-# Ctrl+O (write out), Enter, Ctrl+X (exit)
+gsutil cp gs://main-bucket-67/code/main.py .
 ```
 
-Make sure the `BUCKET` constant at the top of `main.py` matches your bucket.
+Option B: via SSH web UI:
 
-### 5.4. Run the job via `spark-submit`
+* In the SSH window, click the **gear icon → Upload file**.
+* Select your local `main.py`.
+* Confirm it’s there:
 
-From the same SSH shell:
+  ```bash
+  ls
+  head -n 30 main.py
+  ```
+
+Make sure `BUCKET` and `RAW_URI` at the top of `main.py` match your bucket and path.
+
+### 5.4. Run the job
+
+From the master SSH shell:
 
 ```bash
 spark-submit --master yarn --deploy-mode cluster main.py
 ```
 
-What this does:
+On the **first successful run** on any cluster:
 
-* Submits a Spark application to YARN.
-* Driver runs in a YARN container; your SSH session just monitors logs.
-* On the **first** cluster you run it on (e.g., Single Node), it will:
+* The script will see that `ENRICHED_PATH` does not exist.
+* It will **build enrichment from raw CSV**, including ACS lookup.
+* It will write enriched Parquet to `gs://main-bucket-67/outputs/enriched/nc`.
 
-  * Extract & enrich raw data (including ACS calls).
-  * Write enriched Parquet to `ENRICHED_PATH`.
-* On subsequent clusters, the enrichment step is **skipped** and the script directly loads the enriched dataset.
+On subsequent runs:
 
-You’ll see a YARN application ID printed (e.g., `application_...`).
+* It will attempt to read from `ENRICHED_PATH` and **skip enrichment**.
+* If the read fails (e.g., corrupted data), it will log a warning and rebuild from raw CSV automatically.
 
-You can check status from the SSH shell:
+---
+
+## 6. Monitoring Progress
+
+While the job is running:
+
+### 6.1. CLI via YARN
+
+On the master SSH shell:
 
 ```bash
+# See running applications
 yarn application -list
+
+# Get status of a specific application
 yarn application -status <application_id>
 ```
 
-Or via the Web UI (Component Gateway → YARN ResourceManager).
+This gives you:
+
+* State (`RUNNING`, `FINISHED`, etc.).
+* Duration.
+* Tracking URL for the Spark UI.
+
+To view logs so far:
+
+```bash
+yarn logs -applicationId <application_id> | less
+```
+
+You’ll see your `[INFO]` prints plus Spark logs.
+
+### 6.2. Spark UI
+
+1. In the GCP Console → **Dataproc → Clusters → your cluster**.
+2. Click **Web interfaces**.
+3. Open **YARN ResourceManager**.
+4. Find your running application and click the **tracking URL / Spark UI**.
+
+There you can see:
+
+* Jobs and stages
+* Task completion count
+* Shuffle read/write
+* Executors (CPU/memory usage)
 
 ---
 
-## 6. Collecting Results and Performance Metrics
-
-For your report, you want to compare:
-
-* Runtime and resource usage across cluster configurations.
-* Model performance and fairness.
-
-### 6.1. Runtime and resource usage
+## 7. Collecting Results and Comparing Clusters
 
 For each cluster configuration:
 
-1. Note the **start** and **finish** times from:
+1. Run `main.py` as shown.
 
-   * `yarn application -status <app_id>` (fields `Start-Time` and `Finish-Time`), or
-   * Dataproc → **Jobs** → Spark job → `Duration`.
-2. In the **YARN ResourceManager UI**:
+2. Record **runtime**:
 
-   * Look at the application’s **attempt**.
-   * Record:
+   * From `yarn application -status` or Dataproc Jobs UI.
 
-     * Number of **executors** used.
-     * **Memory per executor**.
-     * **Cores per executor**.
-     * Shuffle read/write (MB/GB).
+3. Collect **model metrics** from GCS:
 
-You can then compute a simple **cost proxy**:
-`cluster size (#nodes, cores) × runtime (hours)`.
-
-### 6.2. Model performance and fairness
-
-After each run, `main.py` writes:
-
-```text
-gs://your-nc-opp-bucket/outputs/citation_issued/<timestamp>/
-gs://your-nc-opp-bucket/outputs/arrest_made/<timestamp>/
-  models/
-  metrics/json/
-```
-
-1. Go to **Cloud Storage → your bucket → outputs/**.
-2. For each label (`citation_issued`, `arrest_made`) and timestamp:
-
-   * Navigate to `metrics/json`.
-   * Download the `part-*.txt` file.
-   * It contains a single JSON string with:
-
-     * `results` (a list of models and their metrics: AUROC, AUPRC, fairness by race/sex).
-     * `class_counts_train` (pos/neg totals).
-     * `weights` (class weights used).
-3. Use a local notebook or Python script to parse and compare:
-
-   * **T0 vs T1** for each algorithm (LR, GBT).
-   * Across cluster shapes, metrics should be very similar; the main difference is runtime and resource usage.
-
-You can build tables like:
-
-| Cluster Mode          | Label           | Model            | AUROC | AUPRC | Runtime (min) |
-| --------------------- | --------------- | ---------------- | ----- | ----- | ------------- |
-| Single Node (4c/24GB) | citation_issued | LR_T0_no_time    |       |       |               |
-|                       |                 | LR_T1_with_time  |       |       |               |
-|                       |                 | GBT_T0_no_time   |       |       |               |
-|                       |                 | GBT_T1_with_time |       |       |               |
-| 1M + 2W (4c/24GB)     | ...             | ...              |       |       |               |
-| 1M + 4W (4c/24GB)     | ...             | ...              |       |       |               |
-
----
-
-## 7. Resetting or Rerunning
-
-* If you want to force a fresh **enrichment**, delete the folder:
-
-```bash
-gsutil -m rm -r gs://your-nc-opp-bucket/outputs/enriched/nc
-```
-
-Then re-run `spark-submit`.
-
-* If you only want to rerun modeling with different sampling (`SAMPLE_FRAC`) or other training knobs, just edit the constants at the top of `main.py` and re-run (the enrichment will be reused).
-
----
-
-## 8. Summary
-
-To run everything:
-
-1. **Prepare**:
-
-   * Upload the ZIP to `gs://your-nc-opp-bucket/raw/`.
-   * Edit and upload/copy `main.py` with correct `BUCKET`.
-
-2. **Create cluster** in one of the three configurations.
-
-3. **SSH → `pyspark`** (sanity check), exit.
-
-4. **Upload `main.py`** to master.
-
-5. Run:
-
-   ```bash
-   spark-submit --master yarn --deploy-mode cluster main.py
+   ```text
+   gs://main-bucket-67/outputs/citation_issued/<timestamp>/metrics/json/part-*.txt
+   gs://main-bucket-67/outputs/arrest_made/<timestamp>/metrics/json/part-*.txt
    ```
 
-6. **Repeat** steps 2–5 for each cluster configuration (Single Node, 1M+2W, 1M+4W).
+   Each file holds a single JSON string with:
 
-7. Collect **runtime**, **resource usage**, and **metrics JSON** from GCS for your analysis and presentation.
+   * Model list:
+
+     * `LR_T0_no_time_*`, `LR_T1_with_time_*`
+     * `GBT_T0_no_time_*`, `GBT_T1_with_time_*` (if `RUN_GBT = True`)
+   * AUROC & AUPRC
+   * Fairness tables by race and sex
+   * Class counts and weights.
+
+4. Create a comparison table for your report, e.g.:
+
+| Cluster Mode           | Label           | Model            | AUROC | AUPRC | Runtime (min) |
+| ---------------------- | --------------- | ---------------- | ----- | ----- | ------------- |
+| Single Node (4c/16GB)  | citation_issued | LR_T0_no_time    |       |       |               |
+|                        |                 | LR_T1_with_time  |       |       |               |
+|                        |                 | GBT_T0_no_time   |       |       |               |
+|                        |                 | GBT_T1_with_time |       |       |               |
+| 1M + 2W (4c/16GB each) | ...             | ...              |       |       |               |
+| 1M + 4W (4c/16GB each) | ...             | ...              |       |       |               |
+
+This lets you talk about:
+
+* **Scaling out** (more nodes, same per-node specs) vs runtime and shuffle.
+* **Scaling up sample size** (adjust `SAMPLE_FRAC` toward 1.0).
+* **Effect of time features** (T0 vs T1) on predictive performance.
+
+---
+
+## 8. Resetting / Rerunning
+
+* To force a **clean re-enrichment**:
+
+  ```bash
+  gsutil -m rm -r gs://main-bucket-67/outputs/enriched/nc
+  ```
+
+  Then rerun `spark-submit`.
+
+* To run on a **smaller sample** for debugging:
+
+  * Edit `SAMPLE_FRAC` at the top of `main.py`, e.g. `0.01`.
+  * Re-upload `main.py` and re-run `spark-submit`.
+
+* To test different **cluster shapes**:
+
+  * Recreate the cluster with the desired nodes/cores/memory.
+  * Repeat the SSH + `spark-submit` workflow.
