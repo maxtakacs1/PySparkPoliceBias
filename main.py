@@ -116,16 +116,44 @@ def make_time_features(df):
     )
     df = df.withColumn("year", F.year("date"))
     df = df.withColumn("time_available", F.col("time").isNotNull().cast("int"))
-    df = df.withColumn("hour_of_day", F.when(F.col("time_available") == 1, F.hour("stop_ts")))
-    df = df.withColumn("hour_sin", F.when(F.col("time_available") == 1,
-                                          F.sin(2 * math.pi * F.col("hour_of_day") / 24.0)))
-    df = df.withColumn("hour_cos", F.when(F.col("time_available") == 1,
-                                          F.cos(2 * math.pi * F.col("hour_of_day") / 24.0)))
-    df = df.withColumn("day_of_week", F.when(F.col("time_available") == 1,
-                                             F.date_format("stop_ts", "u").cast("int")))
-    df = df.withColumn("is_weekend", F.when(F.col("time_available") == 1,
-                                            (F.col("day_of_week") >= 6).cast("int")))
+
+    # Hour-of-day and cyclic encodings (only where time is available)
+    df = df.withColumn(
+        "hour_of_day",
+        F.when(F.col("time_available") == 1, F.hour("stop_ts"))
+    )
+    df = df.withColumn(
+        "hour_sin",
+        F.when(
+            F.col("time_available") == 1,
+            F.sin(2 * math.pi * F.col("hour_of_day") / F.lit(24.0))
+        )
+    )
+    df = df.withColumn(
+        "hour_cos",
+        F.when(
+            F.col("time_available") == 1,
+            F.cos(2 * math.pi * F.col("hour_of_day") / F.lit(24.0))
+        )
+    )
+
+    # Use built-in dayofweek: 1 = Sunday, 7 = Saturday
+    df = df.withColumn(
+        "day_of_week",
+        F.when(F.col("time_available") == 1, F.dayofweek("stop_ts"))
+    )
+
+    # Weekend = Saturday (7) or Sunday (1)
+    df = df.withColumn(
+        "is_weekend",
+        F.when(
+            (F.col("time_available") == 1) & (F.col("day_of_week").isin(1, 7)),
+            F.lit(1)
+        ).when(F.col("time_available") == 1, F.lit(0))
+    )
+
     return df
+
 
 def add_basic_labels_flags(df):
     if "citation_issued" in df.columns:
@@ -336,12 +364,8 @@ if __name__ == "__main__":
              .config("spark.sql.shuffle.partitions", "400")
              .getOrCreate())
 
-    # Enrichment: build or reuse
-    if gcs_exists(spark, ENRICHED_PATH):
-        print(f"[INFO] Enriched dataset exists at {ENRICHED_PATH} — loading.")
-        enriched_df = spark.read.parquet(ENRICHED_PATH)
-    else:
-        print(f"[INFO] Enriched dataset NOT found; building from raw CSV: {RAW_URI}")
+    def build_enriched_from_raw(spark: SparkSession):
+        print(f"[INFO] Building enriched dataset from raw CSV: {RAW_URI}")
 
         # Directly read CSV from GCS (no ZIP or subprocess)
         raw = spark.read.option("header", True).csv(RAW_URI)
@@ -371,7 +395,20 @@ if __name__ == "__main__":
            .partitionBy("year")
            .parquet(ENRICHED_PATH))
         print(f"[INFO] Enriched parquet written to {ENRICHED_PATH}")
-        enriched_df = df
+        return df
+
+    # Enrichment: build or reuse
+    if gcs_exists(spark, ENRICHED_PATH):
+        print(f"[INFO] Enriched dataset exists at {ENRICHED_PATH} — attempting to load.")
+        try:
+            enriched_df = spark.read.parquet(ENRICHED_PATH)
+        except Exception as e:
+            print(f"[WARN] Failed to read existing enriched dataset: {e}")
+            print("[WARN] Rebuilding enriched dataset from raw CSV.")
+            enriched_df = build_enriched_from_raw(spark)
+    else:
+        print(f"[INFO] Enriched dataset NOT found; building from raw CSV: {RAW_URI}")
+        enriched_df = build_enriched_from_raw(spark)
 
     # Optional sampling
     if SAMPLE_FRAC < 1.0:
