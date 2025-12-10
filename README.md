@@ -56,10 +56,8 @@ OUTPUT_BASE   = f"{BUCKET}/outputs"
 CENSUS_API_KEY = "..."  # your ACS API key
 
 SEED        = 67
-SAMPLE_FRAC = 0.05      # fraction of enriched data used for modeling
+SAMPLE_FRAC = 0.50      # fraction of enriched data used for modeling
 RUN_GBT     = True      # also train GBT models
-HASH_DEPT   = True      # use FeatureHasher for department_name
-NUM_HASH_FEAT = 1 << 18
 ```
 
 You only need to change:
@@ -202,10 +200,7 @@ For each label in `["citation_issued", "arrest_made"]`:
    Both pipelines:
 
    * Treat small categoricals (`subject_race`, `subject_sex`, `reason_for_stop`, `type`, `county_name`) via `StringIndexer + OneHotEncoder`.
-   * Encode `department_name`:
-
-     * If `HASH_DEPT = True`: hashed via `FeatureHasher` into a fixed-length sparse vector.
-     * If `HASH_DEPT = False`: use numeric `dept_freq`.
+   * Encode `department_name` using the numeric `dept_freq` feature (count of stops per department).
    * Assemble numeric + encoded features → `features_raw`.
    * Standardize into `features` using `StandardScaler`.
 

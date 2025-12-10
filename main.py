@@ -28,7 +28,7 @@ from urllib.error import HTTPError, URLError
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler, FeatureHasher, Imputer
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler, Imputer
 from pyspark.ml.classification import LogisticRegression, GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 
@@ -54,8 +54,6 @@ CENSUS_API_KEY = "f3f5bf0db3d063859095291d00a0b1027470222a"
 SEED = 67
 SAMPLE_FRAC = 1.0 # 0.05, etc. for testing
 RUN_GBT = True # also train GBT models
-HASH_DEPT = False # hash department_name
-NUM_HASH_FEAT = 1 << 14  # 16,384 hashed dims
 
 
 # SPARK / HDFS HELPERS
@@ -299,7 +297,7 @@ def add_acs_join(df, spark):
 
 # MODEL PIPELINES
 
-def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool, num_hash_features: int):
+def build_pipelines(train_df, include_time: bool, label_col: str):
     cat_small = [c for c in ["subject_race", "subject_sex", "reason_for_stop", "type", "county_name"]
                  if c in train_df.columns]
 
@@ -312,16 +310,6 @@ def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool
 
     stages = indexers + [enc]
     inputs = [f"{c}_oh" for c in cat_small]
-
-    # Department: hashed vector (if enabled)
-    if use_hash and "department_name" in train_df.columns:
-        hasher = FeatureHasher(
-            inputCols=["department_name"],
-            outputCol="dept_hash",
-            numFeatures=num_hash_features,
-        )
-        stages += [hasher]
-        inputs += ["dept_hash"]
 
     # Numeric columns
     num_cols = []
@@ -482,18 +470,9 @@ if __name__ == "__main__":
         train = train.withColumn("class_w", F.when(F.col(label_col) == 1, F.lit(wpos)).otherwise(F.lit(wneg)))
         test  =  test.withColumn("class_w", F.when(F.col(label_col) == 1, F.lit(wpos)).otherwise(F.lit(wneg)))
 
-        # Train-only dept_freq (override global, avoids leakage drift)
-        #if not HASH_DEPT and "department_name" in train.columns:
-        #    tr_freq = (train.groupBy("department_name").count()
-        #               .withColumnRenamed("count", "dept_freq"))
-        #    train = train.join(F.broadcast(tr_freq), on="department_name", how="left")
-        #    test  = test.join(F.broadcast(tr_freq),  on="department_name", how="left")
-
         # Pipelines: T0 (no time) and T1 (with time)
-        pipe_lr_T0,  pipe_gbt_T0  = build_pipelines(train, include_time=False, label_col=label_col,
-                                                    use_hash=HASH_DEPT, num_hash_features=NUM_HASH_FEAT)
-        pipe_lr_T1,  pipe_gbt_T1  = build_pipelines(train, include_time=True,  label_col=label_col,
-                                                    use_hash=HASH_DEPT, num_hash_features=NUM_HASH_FEAT)
+        pipe_lr_T0,  pipe_gbt_T0  = build_pipelines(train, include_time=False, label_col=label_col)
+        pipe_lr_T1,  pipe_gbt_T1  = build_pipelines(train, include_time=True,  label_col=label_col)
 
         # Fit
         m_lr_T0 = pipe_lr_T0.fit(train)
