@@ -16,6 +16,13 @@
 #           - Trains T0 (no time features) and T1 (with time features)
 #           - Uses Logistic Regression + optional GBT
 #           - Writes models + metrics to GCS
+#  - Demographic / SES analysis:
+#       * Uses LR_T1 (with time) for each label
+#       * Looks at actual vs predicted outcomes by:
+#           - income_quartile × subject_race
+#           - minority_share_bucket × subject_race
+#       * Computes fairness metrics by race within each SES bucket
+#       * Writes these to GCS under metrics/demographics
 #
 # Run (from master VM SSH):
 #   spark-submit --master yarn --deploy-mode cluster main.py
@@ -52,7 +59,7 @@ CENSUS_API_KEY = "f3f5bf0db3d063859095291d00a0b1027470222a"
 
 # Training knobs
 SEED = 67
-SAMPLE_FRAC = 1.0 # 0.05, etc. for testing
+SAMPLE_FRAC = 1.0 # 0.05, etc. for testing; set to 1.0 for full data
 RUN_GBT = True # also train GBT models
 
 
@@ -374,6 +381,7 @@ def build_pipelines(train_df, include_time: bool, label_col: str):
 
     return pipe_lr, pipe_gbt
 
+
 def fairness_by(df, label_col, pred_col, group_col):
     g = df.groupBy(group_col).agg(
         F.sum(F.when((F.col(label_col) == 1) & (F.col(pred_col) == 1), 1).otherwise(0)).alias("TP"),
@@ -386,6 +394,75 @@ def fairness_by(df, label_col, pred_col, group_col):
              .withColumn("FPR", F.when(F.col("N") > 0, F.col("FP") / F.col("N")))
              .withColumn("Rate", F.when((F.col("P") + F.col("N")) > 0,
                                         F.col("Pos") / (F.col("P") + F.col("N")))))
+
+
+# DEMOGRAPHIC BUCKETING HELPERS
+
+def add_demographic_buckets(df):
+    """
+    Adds:
+      - income_quartile (Q1_lowest, Q2, Q3, Q4_highest) from median_income
+      - minority_share_stop (county-level share of non-white stops)
+      - minority_share_bucket (quartiles of minority_share_stop)
+    Returns updated df + dicts of quartile breakpoints.
+    """
+    income_quartiles = None
+    minority_quartiles = None
+
+    # Income quartiles from median_income
+    if "median_income" in df.columns:
+        non_null_income = df.filter(F.col("median_income").isNotNull())
+        if non_null_income.limit(1).count() > 0:
+            q = non_null_income.approxQuantile("median_income", [0.25, 0.5, 0.75], 0.01)
+            q1, q2, q3 = q
+            print(f"[INFO] Income quartile breakpoints: q1={q1}, q2={q2}, q3={q3}")
+            df = df.withColumn(
+                "income_quartile",
+                F.when(F.col("median_income") <= F.lit(q1), F.lit("Q1_lowest"))
+                 .when(F.col("median_income") <= F.lit(q2), F.lit("Q2"))
+                 .when(F.col("median_income") <= F.lit(q3), F.lit("Q3"))
+                 .otherwise(F.lit("Q4_highest"))
+            )
+            income_quartiles = {"q1": float(q1), "q2": float(q2), "q3": float(q3)}
+        else:
+            print("[WARN] median_income present but all null; skipping income_quartile.")
+    else:
+        print("[WARN] median_income column missing; skipping income_quartile.")
+
+    # County-level minority share (share of stops that are non-white in that county)
+    if "county_name_norm" in df.columns and "subject_race" in df.columns:
+        df_min = df.withColumn(
+            "is_minority_stop",
+            (F.col("subject_race") != F.lit("white")).cast("double")
+        )
+        county_minority = (
+            df_min.groupBy("county_name_norm")
+                  .agg(
+                      F.mean("is_minority_stop").alias("minority_share_stop"),
+                      F.count("*").alias("n_stops_county")
+                  )
+        )
+        df = df.join(F.broadcast(county_minority), on="county_name_norm", how="left")
+
+        non_null_min = df.filter(F.col("minority_share_stop").isNotNull())
+        if non_null_min.limit(1).count() > 0:
+            mq = non_null_min.approxQuantile("minority_share_stop", [0.25, 0.5, 0.75], 0.01)
+            m1, m2, m3 = mq
+            print(f"[INFO] Minority-share quartiles: q1={m1}, q2={m2}, q3={m3}")
+            df = df.withColumn(
+                "minority_share_bucket",
+                F.when(F.col("minority_share_stop") <= F.lit(m1), F.lit("Q1_lowest"))
+                 .when(F.col("minority_share_stop") <= F.lit(m2), F.lit("Q2"))
+                 .when(F.col("minority_share_stop") <= F.lit(m3), F.lit("Q3"))
+                 .otherwise(F.lit("Q4_highest"))
+            )
+            minority_quartiles = {"q1": float(m1), "q2": float(m2), "q3": float(m3)}
+        else:
+            print("[WARN] minority_share_stop all null; skipping minority_share_bucket.")
+    else:
+        print("[WARN] Missing county_name_norm or subject_race; skipping minority_share buckets.")
+
+    return df, income_quartiles, minority_quartiles
 
 
 # MAIN
@@ -449,6 +526,11 @@ if __name__ == "__main__":
     # Restrict to time-present cohort for T0 vs T1 comparison
     df_time = enriched_df.filter(F.col("time_available") == 1)
 
+    # Add SES buckets and county-level minority share to df_time
+    income_quartiles = None
+    minority_quartiles = None
+    df_time, income_quartiles, minority_quartiles = add_demographic_buckets(df_time)
+
     # Two label tasks
     TASKS = ["citation_issued", "arrest_made"]
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -484,8 +566,16 @@ if __name__ == "__main__":
             m_gbt_T0 = m_gbt_T1 = None
 
         # Evaluate
-        eval_roc = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol="rawPrediction", metricName="areaUnderROC")
-        eval_pr  = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol="rawPrediction", metricName="areaUnderPR")
+        eval_roc = BinaryClassificationEvaluator(
+            labelCol=label_col,
+            rawPredictionCol="rawPrediction",
+            metricName="areaUnderROC"
+        )
+        eval_pr  = BinaryClassificationEvaluator(
+            labelCol=label_col,
+            rawPredictionCol="rawPrediction",
+            metricName="areaUnderPR"
+        )
 
         def eval_model(model, name):
             if not model:
@@ -525,5 +615,74 @@ if __name__ == "__main__":
         )
 
         print(f"[INFO] DONE label={label_col}. Artifacts at: {base_out}")
+
+        # This ties outcomes + model behavior to income & % minority
+        try:
+            # Score full base_df with LR_T1
+            pred_all = m_lr_T1.transform(base_df)
+            pred_all = pred_all.withColumn("p_hat", F.col("probability")[1])
+
+            demo_metrics = {
+                "income_quartiles": income_quartiles,
+                "minority_quartiles": minority_quartiles,
+            }
+
+            # 1) Actual vs predicted by income_quartile × subject_race
+            if "income_quartile" in pred_all.columns:
+                rates_income_race = (
+                    pred_all.groupBy("income_quartile", "subject_race")
+                            .agg(
+                                F.mean(F.col(label_col).cast("double")).alias("actual_rate"),
+                                F.mean("p_hat").alias("avg_pred_prob"),
+                                F.count("*").alias("n_stops")
+                            )
+                )
+                demo_metrics["rates_by_income_race"] = [r.asDict() for r in rates_income_race.collect()]
+
+                # Fairness by race within each income quartile
+                fairness_by_income = {}
+                for bucket in ["Q1_lowest", "Q2", "Q3", "Q4_highest"]:
+                    sub = pred_all.filter(F.col("income_quartile") == bucket)
+                    if sub.limit(1).count() == 0:
+                        continue
+                    fair = fairness_by(sub, label_col, "prediction", "subject_race")
+                    fairness_by_income[bucket] = fair.toPandas().to_dict(orient="list")
+                demo_metrics["fairness_by_income_race"] = fairness_by_income
+            else:
+                print(f"[WARN] income_quartile missing in pred_all for label {label_col}; skipping income-based analysis.")
+
+            # 2) Actual vs predicted by minority_share_bucket × subject_race
+            if "minority_share_bucket" in pred_all.columns:
+                rates_minority_race = (
+                    pred_all.groupBy("minority_share_bucket", "subject_race")
+                            .agg(
+                                F.mean(F.col(label_col).cast("double")).alias("actual_rate"),
+                                F.mean("p_hat").alias("avg_pred_prob"),
+                                F.count("*").alias("n_stops")
+                            )
+                )
+                demo_metrics["rates_by_minority_bucket_race"] = [r.asDict() for r in rates_minority_race.collect()]
+
+                fairness_by_minority_bucket = {}
+                for bucket in ["Q1_lowest", "Q2", "Q3", "Q4_highest"]:
+                    sub = pred_all.filter(F.col("minority_share_bucket") == bucket)
+                    if sub.limit(1).count() == 0:
+                        continue
+                    fair = fairness_by(sub, label_col, "prediction", "subject_race")
+                    fairness_by_minority_bucket[bucket] = fair.toPandas().to_dict(orient="list")
+                demo_metrics["fairness_by_minority_bucket_race"] = fairness_by_minority_bucket
+            else:
+                print(f"[WARN] minority_share_bucket missing in pred_all for label {label_col}; skipping minority-share analysis.")
+
+            # Write demographic metrics to GCS
+            write_json_to_gcs(
+                spark,
+                demo_metrics,
+                f"{base_out}/metrics/demographics"
+            )
+            print(f"[INFO] Demographic metrics written for label={label_col} at {base_out}/metrics/demographics")
+
+        except Exception as e:
+            print(f"[WARN] Demographic / SES analysis failed for label {label_col}: {e}")
 
     spark.stop()
