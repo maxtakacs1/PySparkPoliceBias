@@ -28,7 +28,7 @@ from urllib.error import HTTPError, URLError
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler, FeatureHasher
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler, FeatureHasher, Imputer
 from pyspark.ml.classification import LogisticRegression, GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 
@@ -54,8 +54,8 @@ CENSUS_API_KEY = "f3f5bf0db3d063859095291d00a0b1027470222a"
 SEED = 67
 SAMPLE_FRAC = 1.0 # 0.05, etc. for testing
 RUN_GBT = True # also train GBT models
-HASH_DEPT = True # hash department_name
-NUM_HASH_FEAT = 1 << 18  # 262,144 hashed dims
+HASH_DEPT = False # hash department_name
+NUM_HASH_FEAT = 1 << 14  # 16,384 hashed dims
 
 
 # SPARK / HDFS HELPERS
@@ -303,6 +303,7 @@ def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool
     cat_small = [c for c in ["subject_race", "subject_sex", "reason_for_stop", "type", "county_name"]
                  if c in train_df.columns]
 
+    # Index + one-hot encode categorical features
     indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in cat_small]
     enc = OneHotEncoder(
         inputCols=[f"{c}_idx" for c in cat_small],
@@ -312,12 +313,17 @@ def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool
     stages = indexers + [enc]
     inputs = [f"{c}_oh" for c in cat_small]
 
+    # Department: hashed vector (if enabled)
     if use_hash and "department_name" in train_df.columns:
-        hasher = FeatureHasher(inputCols=["department_name"], outputCol="dept_hash",
-                               numFeatures=num_hash_features)
+        hasher = FeatureHasher(
+            inputCols=["department_name"],
+            outputCol="dept_hash",
+            numFeatures=num_hash_features,
+        )
         stages += [hasher]
         inputs += ["dept_hash"]
 
+    # Numeric columns
     num_cols = []
     for c in ["subject_age", "median_income", "poverty_rate", "unemployment_rate",
               "edu_bachelor_pct", "dept_freq", "location_known", "county_known"]:
@@ -329,15 +335,53 @@ def build_pipelines(train_df, include_time: bool, label_col: str, use_hash: bool
             if c in train_df.columns:
                 num_cols.append(c)
 
-    assembler = VectorAssembler(inputCols=inputs + num_cols, outputCol="features_raw")
-    scaler = StandardScaler(inputCol="features_raw", outputCol="features", withStd=True, withMean=False)
+    # Impute numeric columns so VectorAssembler doesn't see nulls
+    imputed_num_cols = []
+    if num_cols:
+        imputed_num_cols = [c + "_imp" for c in num_cols]
+        imputer = Imputer(
+            inputCols=num_cols,
+            outputCols=imputed_num_cols,
+            strategy="median"
+        )
+        stages.append(imputer)
 
-    lr = LogisticRegression(labelCol=label_col, featuresCol="features",
-                            maxIter=50, regParam=0.01, elasticNetParam=0.1, weightCol="class_w")
-    gbt = GBTClassifier(labelCol=label_col, featuresCol="features",
-                        maxDepth=6, maxIter=60, stepSize=0.1, subsamplingRate=0.8)
+    # Use OHE outputs + imputed numeric columns as inputs
+    assembler_input_cols = inputs + (imputed_num_cols if imputed_num_cols else [])
 
-    pipe_lr  = Pipeline(stages=stages + [assembler, scaler, lr])
+    assembler = VectorAssembler(
+        inputCols=assembler_input_cols,
+        outputCol="features_raw",
+        handleInvalid="keep"  # just in case anything weird sneaks through
+    )
+
+    scaler = StandardScaler(
+        inputCol="features_raw",
+        outputCol="features",
+        withStd=True,
+        withMean=False
+    )
+
+    lr = LogisticRegression(
+        labelCol=label_col,
+        featuresCol="features",
+        maxIter=50,
+        regParam=0.01,
+        elasticNetParam=0.1,
+        weightCol="class_w"
+    )
+
+    gbt = GBTClassifier(
+        labelCol=label_col,
+        featuresCol="features",
+        maxDepth=4,
+        maxIter=20,
+        maxBins=32,
+        stepSize=0.1,
+        subsamplingRate=0.8
+    )
+
+    pipe_lr = Pipeline(stages=stages + [assembler, scaler, lr])
     pipe_gbt = Pipeline(stages=stages + [assembler, scaler, gbt])
 
     return pipe_lr, pipe_gbt
@@ -439,11 +483,11 @@ if __name__ == "__main__":
         test  =  test.withColumn("class_w", F.when(F.col(label_col) == 1, F.lit(wpos)).otherwise(F.lit(wneg)))
 
         # Train-only dept_freq (override global, avoids leakage drift)
-        if not HASH_DEPT and "department_name" in train.columns:
-            tr_freq = (train.groupBy("department_name").count()
-                       .withColumnRenamed("count", "dept_freq"))
-            train = train.join(F.broadcast(tr_freq), on="department_name", how="left")
-            test  = test.join(F.broadcast(tr_freq),  on="department_name", how="left")
+        #if not HASH_DEPT and "department_name" in train.columns:
+        #    tr_freq = (train.groupBy("department_name").count()
+        #               .withColumnRenamed("count", "dept_freq"))
+        #    train = train.join(F.broadcast(tr_freq), on="department_name", how="left")
+        #    test  = test.join(F.broadcast(tr_freq),  on="department_name", how="left")
 
         # Pipelines: T0 (no time) and T1 (with time)
         pipe_lr_T0,  pipe_gbt_T0  = build_pipelines(train, include_time=False, label_col=label_col,
@@ -461,14 +505,14 @@ if __name__ == "__main__":
             m_gbt_T0 = m_gbt_T1 = None
 
         # Evaluate
-        eval_roc = BinaryClassificationEvaluator(labelCol=label_col, metricName="areaUnderROC")
-        eval_pr  = BinaryClassificationEvaluator(labelCol=label_col, metricName="areaUnderPR")
+        eval_roc = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol="rawPrediction", metricName="areaUnderROC")
+        eval_pr  = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol="rawPrediction", metricName="areaUnderPR")
 
         def eval_model(model, name):
             if not model:
                 return {}
             pred = (model.transform(test)
-                    .select(label_col, "prediction", "probability", "subject_race", "subject_sex"))
+                    .select(label_col, "prediction", "rawPrediction", "probability", "subject_race", "subject_sex"))
             auroc = eval_roc.evaluate(pred)
             aupr  = eval_pr.evaluate(pred)
             fair_race = fairness_by(pred, label_col, "prediction", "subject_race").toPandas().to_dict(orient="list")
