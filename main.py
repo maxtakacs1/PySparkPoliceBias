@@ -38,6 +38,7 @@ from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler, Imputer
 from pyspark.ml.classification import LogisticRegression, GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.functions import vector_to_array
 
 # CONFIG / PATHS
 
@@ -620,7 +621,7 @@ if __name__ == "__main__":
         try:
             # Score full base_df with LR_T1
             pred_all = m_lr_T1.transform(base_df)
-            pred_all = pred_all.withColumn("p_hat", F.col("probability")[1])
+            pred_all = pred_all.withColumn("p_hat", vector_to_array("probability")[1])
 
             demo_metrics = {
                 "income_quartiles": income_quartiles,
