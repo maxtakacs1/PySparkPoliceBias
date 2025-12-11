@@ -60,6 +60,12 @@ SAMPLE_FRAC = 0.50      # fraction of enriched data used for modeling
 RUN_GBT     = True      # also train GBT models
 ```
 
+At the end of each run the script also writes runtime timings (overall and per-model fits) as JSON to:
+
+```text
+gs://<bucket>/outputs/run_time/<timestamp>/runtime.txt
+```
+
 You only need to change:
 
 * `BUCKET` if your bucket name is different.
@@ -221,6 +227,7 @@ For each label in `["citation_issued", "arrest_made"]`:
    For each label (e.g. `citation_issued`) and run timestamp:
 
    ```text
+   gs://main-bucket-67/outputs/run_time/<timestamp>/runtime.txt   # overall + per-model fit durations (JSON)
    gs://main-bucket-67/outputs/citation_issued/<timestamp>/
      models/
        LR_T0/
