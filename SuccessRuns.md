@@ -1,7 +1,7 @@
 # Successful Run Filepaths
 
 ### Single Node
-- 100% of data - n/a
+- 100% of data - 20251211-170238
 - 50% of data - n/a
 - 25% of data - n/a
 - 5% of data - n/a
