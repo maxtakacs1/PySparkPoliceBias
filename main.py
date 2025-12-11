@@ -27,7 +27,7 @@
 # Run (from master VM SSH):
 #   spark-submit --master yarn --deploy-mode cluster main.py
 
-import os, sys, math, json
+import os, sys, math, json, time
 from datetime import datetime, timezone
 from urllib.request import urlopen
 from urllib.parse import urlencode
@@ -469,6 +469,7 @@ def add_demographic_buckets(df):
 # MAIN
 
 if __name__ == "__main__":
+    overall_start = time.monotonic()
     spark = (SparkSession.builder
              .appName("nc-opp-enrich-train")
              .config("spark.sql.shuffle.partitions", "400")
@@ -535,6 +536,7 @@ if __name__ == "__main__":
     # Two label tasks
     TASKS = ["citation_issued", "arrest_made"]
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    runtime_metrics = {"timestamp": ts, "overall_seconds": None, "models": {}}
 
     for label_col in TASKS:
         print(f"[INFO] Training label: {label_col}")
@@ -558,13 +560,28 @@ if __name__ == "__main__":
         pipe_lr_T1,  pipe_gbt_T1  = build_pipelines(train, include_time=True,  label_col=label_col)
 
         # Fit
+        label_times = {}
+
+        t0 = time.monotonic()
         m_lr_T0 = pipe_lr_T0.fit(train)
+        label_times["LR_T0_seconds"] = time.monotonic() - t0
+
+        t0 = time.monotonic()
         m_lr_T1 = pipe_lr_T1.fit(train)
+        label_times["LR_T1_seconds"] = time.monotonic() - t0
+
         if RUN_GBT:
+            t0 = time.monotonic()
             m_gbt_T0 = pipe_gbt_T0.fit(train)
+            label_times["GBT_T0_seconds"] = time.monotonic() - t0
+
+            t0 = time.monotonic()
             m_gbt_T1 = pipe_gbt_T1.fit(train)
+            label_times["GBT_T1_seconds"] = time.monotonic() - t0
         else:
             m_gbt_T0 = m_gbt_T1 = None
+
+        runtime_metrics["models"][label_col] = label_times
 
         # Evaluate
         eval_roc = BinaryClassificationEvaluator(
@@ -685,5 +702,12 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"[WARN] Demographic / SES analysis failed for label {label_col}: {e}")
+
+    runtime_metrics["overall_seconds"] = time.monotonic() - overall_start
+    write_json_to_gcs(
+        spark,
+        runtime_metrics,
+        f"{OUTPUT_BASE}/run_time/{ts}/runtime.txt"
+    )
 
     spark.stop()
