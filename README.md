@@ -17,9 +17,9 @@ This project uses **PySpark on Google Cloud Dataproc** to analyze the **North Ca
   * **T1** – model **with time features**
 * Compare performance across three **Dataproc cluster configurations**:
 
-  1. Single node: 4 cores, 16 GB
-  2. 1 master + 2 workers: 4 cores, 16 GB per node
-  3. 1 master + 4 workers: 4 cores, 16 GB per node
+  1. Single node: 4 cores, 32 GB
+  2. 1 master + 2 workers: 4 cores, 32 GB per node
+  3. 1 master + 2 workers: 2 cores, 16 GB per node
 
 The workflow is:
 
