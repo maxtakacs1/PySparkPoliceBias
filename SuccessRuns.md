@@ -14,9 +14,9 @@
 - 5% of data - 20251211-234052
 - 1% of data - 20251211-231525
 
-### 1 Master 2 Worker 2 core 16 GB
-- 100% of data - n/a
-- 50% of data - n/a
-- 25% of data - n/a
-- 5% of data - n/a
-- 1% of data - n/a
+### 1 Master 2 Worker 2 core 16 GB (n4-standard-4)
+- 100% of data - 20251212-032648
+- 50% of data - 20251212-140509
+- 25% of data - 20251212-152413
+- 5% of data - 20251212-161211
+- 1% of data - 20251212-164746
