@@ -233,10 +233,10 @@ def census_get(year: int, dataset_suffix: str, vars_list):
 
 def fetch_nc_acs(years):
     # variables:
-    #  median income: B19013_001E  (acs5)
-    #  poverty %:     S1701_C03_001E (subject)
+    #  median income: B19013_001E (acs5)
+    #  poverty %: S1701_C03_001E (subject)
     #  unemployment%: S2301_C04_001E (subject)
-    #  bachelor's+:   DP02_0068PE (profile)
+    #  bachelor's+: DP02_0068PE (profile)
     acs_rows = []
     for y in sorted(set(years)):
         acs_rows += census_get(y, "", ["B19013_001E"])
