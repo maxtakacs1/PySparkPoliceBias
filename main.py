@@ -1,30 +1,30 @@
-# main.py — Dataproc / YARN cluster PySpark pipeline for NC Open Policing Project
+# Dataproc-based YARN cluster PySpark pipeline for NC Open Policing Project
 #
 # FLOW:
 #  - On first run:
-#       * Reads RAW CSV from GCS (NC statewide CSV already extracted from ZIP)
-#       * Cleans + enriches data:
+#       - Reads RAW CSV from GCS (NC statewide CSV already extracted from ZIP)
+#       - Cleans + enriches data:
 #           - time features
 #           - labels & flags
 #           - ACS county-level demographics from Census ACS for NC counties
-#       * Writes enriched Parquet partitioned by year to ENRICHED_PATH
+#       - Writes enriched Parquet partitioned by year to ENRICHED_PATH
 #  - On subsequent runs:
-#       * Skips enrichment and directly reads ENRICHED_PATH
+#       - Skips enrichment and directly reads ENRICHED_PATH
 #  - Modeling:
-#       * Restricts to rows with time_available == 1
-#       * For each label in ["citation_issued", "arrest_made"]:
+#       - Restricts to rows with time_available == 1
+#       - For each label in ["citation_issued", "arrest_made"]:
 #           - Trains T0 (no time features) and T1 (with time features)
 #           - Uses Logistic Regression + optional GBT
 #           - Writes models + metrics to GCS
 #  - Demographic / SES analysis:
-#       * Uses LR_T1 (with time) for each label
-#       * Looks at actual vs predicted outcomes by:
-#           - income_quartile × subject_race
-#           - minority_share_bucket × subject_race
-#       * Computes fairness metrics by race within each SES bucket
-#       * Writes these to GCS under metrics/demographics
+#       - Uses LR_T1 (with time) for each label
+#       - Looks at actual vs predicted outcomes by:
+#           - income_quartile x subject_race
+#           - minority_share_bucket x subject_race
+#       - Computes fairness metrics by race within each SES bucket
+#       - Writes these to GCS under metrics/demographics
 #
-# Run (from master VM SSH):
+# Run from master VM SSH:
 #   spark-submit --master yarn --deploy-mode cluster main.py
 
 import os, sys, math, json, time
@@ -45,8 +45,7 @@ from pyspark.ml.functions import vector_to_array
 BUCKET = "gs://main-bucket-67"
 
 # RAW CSV from Open Policing Project (already extracted from ZIP and uploaded)
-# Make sure this exists:
-#   gsutil cp nc_statewide_2020_04_01.csv gs://main-bucket-67/raw/nc_statewide_2020_04_01.csv
+# Make sure this exists before first run
 RAW_URI = f"{BUCKET}/raw/nc_statewide_2020_04_01.csv"
 
 # Enriched Parquet location (directory)
@@ -275,7 +274,7 @@ def add_acs_join(df, spark):
     if not years_present:
         return df
 
-    # Map early years to first ACS 5-year we know (e.g., 2009)
+    # Map early years to first ACS 5-year we know (2009)
     acs_years = []
     for y in years_present:
         if y is None:
@@ -645,7 +644,7 @@ if __name__ == "__main__":
                 "minority_quartiles": minority_quartiles,
             }
 
-            # 1) Actual vs predicted by income_quartile × subject_race
+            # 1) Actual vs predicted by income_quartile x subject_race
             if "income_quartile" in pred_all.columns:
                 rates_income_race = (
                     pred_all.groupBy("income_quartile", "subject_race")
@@ -669,7 +668,7 @@ if __name__ == "__main__":
             else:
                 print(f"[WARN] income_quartile missing in pred_all for label {label_col}; skipping income-based analysis.")
 
-            # 2) Actual vs predicted by minority_share_bucket × subject_race
+            # 2) Actual vs predicted by minority_share_bucket x subject_race
             if "minority_share_bucket" in pred_all.columns:
                 rates_minority_race = (
                     pred_all.groupBy("minority_share_bucket", "subject_race")
