@@ -1,5 +1,6 @@
 # Dataproc-based YARN cluster PySpark pipeline for NC Open Policing Project
-#
+# Sam Friedman and Max Takacs for BIA 678-A 2025
+# Underneath the import statements there are a couple instructions on what to do to run this code.
 # FLOW:
 #  - On first run:
 #       - Reads RAW CSV from GCS (NC statewide CSV already extracted from ZIP)
@@ -42,19 +43,20 @@ from pyspark.ml.functions import vector_to_array
 
 # CONFIG / PATHS
 
+# GCS bucket; change to your bucket being used to run our project
 BUCKET = "gs://main-bucket-67"
 
 # RAW CSV from Open Policing Project (already extracted from ZIP and uploaded)
 # Make sure this exists before first run
 RAW_URI = f"{BUCKET}/raw/nc_statewide_2020_04_01.csv"
 
-# Enriched Parquet location (directory)
+# Enriched Parquet location (directory) DO NOT CREATE THIS MANUALLY (if it exists, our code will assume enrichment is done)
 ENRICHED_PATH = f"{BUCKET}/outputs/enriched/nc"
 
 # Outputs base (models + metrics)
 OUTPUT_BASE = f"{BUCKET}/outputs"
 
-# Optional Census API key; None = anonymous (OK for small pulls)
+# Optional Census API key; None = anonymous (OK for small pulls, this one is Max's and can be used to test our code)
 CENSUS_API_KEY = "f3f5bf0db3d063859095291d00a0b1027470222a"
 
 # Training knobs
