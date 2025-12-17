@@ -14,7 +14,7 @@
 #       - Restricts to rows with time_available == 1
 #       - For each label in ["citation_issued", "arrest_made"]:
 #           - Trains T0 (no time features) and T1 (with time features)
-#           - Uses Logistic Regression + optional GBT
+#           - Uses Logistic Regression + GBT (optional due to training time req'd)
 #           - Writes models + metrics to GCS
 #  - Demographic / SES analysis:
 #       - Uses LR_T1 (with time) for each label
@@ -413,7 +413,14 @@ def fairness_by(df, label_col, pred_col, group_col):
 # DEMOGRAPHIC BUCKETING HELPERS
 
 def add_demographic_buckets(df):
-    """Bucket SES/ethnicity features (income and minority share) for fairness analysis; called on time-filtered data."""
+    """
+    Adds:
+      - income_quartile (Q1_lowest, Q2, Q3, Q4_highest) from median_income
+      - minority_share_stop (county-level share of non-white stops)
+      - minority_share_bucket (quartiles of minority_share_stop)
+    Returns updated df + dicts of quartile breakpoints.
+    Called on time-filtered data.
+    """
     income_quartiles = None
     minority_quartiles = None
 
