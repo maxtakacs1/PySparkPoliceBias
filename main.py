@@ -66,6 +66,7 @@ RUN_GBT = True # also train GBT models
 # SPARK / HDFS HELPERS
 
 def gcs_exists(spark: SparkSession, path: str) -> bool:
+    """Return True if the given GCS path exists; used before reading/writing to avoid runtime failures."""
     jvm = spark._jvm
     hconf = spark._jsc.hadoopConfiguration()
     uri = jvm.java.net.URI(path)
@@ -73,6 +74,7 @@ def gcs_exists(spark: SparkSession, path: str) -> bool:
     return fs.exists(jvm.org.apache.hadoop.fs.Path(path))
 
 def write_json_to_gcs(spark, obj, path: str):
+    """Write a small JSON-serializable object to GCS; used for lightweight metrics or config outputs."""
     (spark.createDataFrame([json.dumps(obj)], "string")
           .toDF("json")
           .coalesce(1)
@@ -84,9 +86,11 @@ def write_json_to_gcs(spark, obj, path: str):
 YN_COLS = ["citation_issued", "arrest_made", "warning_issued", "search_conducted", "frisk_performed"]
 
 def clean_column_names(df):
+    """Lowercase and underscore column names; used right after reading raw CSV to standardize schema."""
     return df.select([F.col(c).alias(c.strip().lower().replace(" ", "_")) for c in df.columns])
 
 def normalize_booleans(df):
+    """Normalize Y/N-like string columns to integer 0/1; use once the columns are cleaned."""
     for c in [x for x in YN_COLS if x in df.columns]:
         df = df.withColumn(
             c,
@@ -95,6 +99,7 @@ def normalize_booleans(df):
     return df
 
 def standardize_strings(df, cols):
+    """Trim/lower string columns and null out empties; used to remove noisy placeholders before feature work."""
     for c in cols:
         if c in df.columns:
             df = df.withColumn(
@@ -105,6 +110,7 @@ def standardize_strings(df, cols):
     return df
 
 def clip_age(df):
+    """Drop implausible ages outside 16-100; used to limit influence of obvious data errors."""
     if "subject_age" in df.columns:
         df = df.withColumn(
             "subject_age",
@@ -114,6 +120,7 @@ def clip_age(df):
     return df
 
 def make_time_features(df):
+    """Add timestamp-derived columns (hour/day/weekend) and availability flag; used after cleaning date/time."""
     df = df.withColumn("date", F.to_date("date"))
     df = df.withColumn(
         "stop_ts",
@@ -161,6 +168,7 @@ def make_time_features(df):
 
 
 def add_basic_labels_flags(df):
+    """Add convenience label/flag columns and normalized county name; used prior to downstream joins or modeling."""
     if "citation_issued" in df.columns:
         df = df.withColumn("citation_yn", F.col("citation_issued"))
     if "arrest_made" in df.columns:
@@ -199,12 +207,14 @@ def add_basic_labels_flags(df):
 # ACS FETCH AND JOIN
 
 def _to_float(x):
+    """Safely cast to float, returning None on failure; used when parsing ACS numeric fields."""
     try:
         return float(x)
     except Exception:
         return None
 
 def census_get(year: int, dataset_suffix: str, vars_list):
+    """Fetch selected ACS variables for NC counties for a year; used as low-level helper for ACS pulls."""
     base = f"https://api.census.gov/data/{year}/acs/acs5{dataset_suffix}"
     params = {
         "get": ",".join(["NAME"] + vars_list),
@@ -232,6 +242,7 @@ def census_get(year: int, dataset_suffix: str, vars_list):
     return out
 
 def fetch_nc_acs(years):
+    """Fetch ACS metrics for NC for given years and reshape for Spark ingestion; used before joining to stops."""
     # variables:
     #  median income: B19013_001E (acs5)
     #  poverty %: S1701_C03_001E (subject)
@@ -267,6 +278,7 @@ def fetch_nc_acs(years):
     return result
 
 def add_acs_join(df, spark):
+    """Attach ACS demographics to stops by county and year; used after labeling counties and computing year."""
     if "county_name_norm" not in df.columns or "year" not in df.columns:
         return df
 
@@ -305,6 +317,7 @@ def add_acs_join(df, spark):
 # MODEL PIPELINES
 
 def build_pipelines(train_df, include_time: bool, label_col: str):
+    """Construct LR and GBT pipelines with optional time features for a label; used before fitting models."""
     cat_small = [c for c in ["subject_race", "subject_sex", "reason_for_stop", "type", "county_name"]
                  if c in train_df.columns]
 
@@ -383,6 +396,7 @@ def build_pipelines(train_df, include_time: bool, label_col: str):
 
 
 def fairness_by(df, label_col, pred_col, group_col):
+    """Compute TPR/FPR and positive rates by a grouping column; used for quick fairness slices on predictions."""
     g = df.groupBy(group_col).agg(
         F.sum(F.when((F.col(label_col) == 1) & (F.col(pred_col) == 1), 1).otherwise(0)).alias("TP"),
         F.sum(F.when(F.col(label_col) == 1, 1).otherwise(0)).alias("P"),
@@ -399,13 +413,7 @@ def fairness_by(df, label_col, pred_col, group_col):
 # DEMOGRAPHIC BUCKETING HELPERS
 
 def add_demographic_buckets(df):
-    """
-    Adds:
-      - income_quartile (Q1_lowest, Q2, Q3, Q4_highest) from median_income
-      - minority_share_stop (county-level share of non-white stops)
-      - minority_share_bucket (quartiles of minority_share_stop)
-    Returns updated df + dicts of quartile breakpoints.
-    """
+    """Bucket SES/ethnicity features (income and minority share) for fairness analysis; called on time-filtered data."""
     income_quartiles = None
     minority_quartiles = None
 
@@ -475,6 +483,7 @@ if __name__ == "__main__":
              .getOrCreate())
 
     def build_enriched_from_raw(spark: SparkSession):
+        """Read raw CSV, clean/enrich with ACS + flags, and write parquet; run when no enriched data exists."""
         print(f"[INFO] Building enriched dataset from raw CSV: {RAW_URI}")
 
         # Directly read CSV from GCS (no ZIP or subprocess)
@@ -595,6 +604,7 @@ if __name__ == "__main__":
         )
 
         def eval_model(model, name):
+            """Score a model on the test split and compute metrics; called for each trained estimator."""
             if not model:
                 return {}
             pred = (model.transform(test)
